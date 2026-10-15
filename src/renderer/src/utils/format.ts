@@ -113,8 +113,9 @@ export function formatSpeedOfLimit(
 
 export function formatEta(seconds: number): string {
   if (!Number.isFinite(seconds) || seconds <= 0) return '—'
-  if (seconds < 60) return `${Math.max(1, Math.ceil(seconds))}s`
-  const totalSec = Math.round(seconds)
+  // Seconds round up, so anything past 59s is a minute: "1m 0s", never "60s".
+  if (Math.ceil(seconds) < 60) return `${Math.max(1, Math.ceil(seconds))}s`
+  const totalSec = Math.max(60, Math.round(seconds))
   const mins = Math.floor(totalSec / 60)
   const secs = totalSec % 60
   if (mins < 60) return `${mins}m ${secs}s`

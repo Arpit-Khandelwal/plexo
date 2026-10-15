@@ -1,6 +1,7 @@
 import { expect, test } from '@playwright/test'
 import {
   formatBytes,
+  formatEta,
   formatPercent,
   formatSpeed,
   speedTicks
@@ -31,5 +32,13 @@ test.describe('formatting @smoke', () => {
     expect(top).toBeGreaterThanOrEqual(0.5)
     expect(ticks.length).toBeGreaterThan(0)
     for (const tick of ticks) expect(tick.label).toMatch(/ B\/s$/)
+  })
+
+  test('a countdown never reads 60s', () => {
+    expect(formatEta(0.2)).toBe('1s')
+    expect(formatEta(58.2)).toBe('59s')
+    expect(formatEta(59.01)).toBe('1m 0s')
+    expect(formatEta(59.5)).toBe('1m 0s')
+    expect(formatEta(61)).toBe('1m 1s')
   })
 })
