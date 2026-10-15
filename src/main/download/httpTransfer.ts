@@ -20,7 +20,13 @@ import {
 import { downloadChunk, fetchRange, HttpStatusError, RemoteChangedError } from './chunkDownloader'
 import { compareVersion, type FileVersion } from './fileVersion'
 import { interleave, MAX_STREAMS_PER_NETWORK, startingStreams } from './plan'
-import { pickWork, type SchedulerPolicy, type Segment, type Work } from './scheduler'
+import {
+  pickWork,
+  type NetworkLoad,
+  type SchedulerPolicy,
+  type Segment,
+  type Work
+} from './scheduler'
 import {
   delay,
   recomputeAggregates,
@@ -159,6 +165,22 @@ const SCHEDULER_POLICY: SchedulerPolicy = {
   maxHedgesPerBlock: 2,
   startupMs: 1000,
   minSplitBytes: 256 * 1024
+}
+
+// Whether a network has room to spare, before the scheduler splits a block (see hasSpare there):
+// what it received over about the last second against its peak. The peak is the best its speed (a
+// few seconds' average, so a burst doesn't count) has read, sliding back by half over a minute so
+// a network that got slower for good isn't held to what it once did. The last second rather than
+// the speed's few: when streams free up on a network that is full, the others take up their share
+// at once and a second shows it; on one that isn't, a second shows the drop, a few seconds sooner.
+const LOAD_WINDOW_MS = 1000
+const PEAK_HALF_LIFE_MS = 60_000
+
+/** How a network is doing, for splitting (see LOAD_WINDOW_MS). */
+interface NetworkPace {
+  peakBytesPerSec: number
+  /** What it had received in all at each tick, over the last LOAD_WINDOW_MS and a little. */
+  readings: { time: number; received: number }[]
 }
 
 /** Bytes a split fetched ahead of where its block has got to, and the network they came from. */
@@ -314,6 +336,9 @@ export class HttpTransfer implements Transfer {
   /** By network id: everything its streams have received, and when it last showed it was alive —
    * received something, or came into use. */
   private traffic = new Map<string, { received: number; aliveAt: number }>()
+  /** By network id: how it is doing, for splitting (see samplePaces). Forgotten on reset: a new
+   * run measures afresh. */
+  private paces = new Map<string, NetworkPace>()
   /** By network id: until when the server asked (Retry-After) not to be sent new requests over
    * it. */
   private holdUntil = new Map<string, number>()
@@ -392,6 +417,7 @@ export class HttpTransfer implements Transfer {
   }
 
   tick(now: number): void {
+    this.samplePaces(now)
     this.refreshStuckConnections(now)
     this.host.reconcile()
     // Taken with or without Auto: it also judges the disk, which the user is told about either way.
@@ -402,6 +428,35 @@ export class HttpTransfer implements Transfer {
       self.refused = false
       self.served = false
     }
+  }
+
+  /** Notes what each network has received as of this tick, and brings its peak up to its speed
+   * after letting it slide. */
+  private samplePaces(now: number): void {
+    for (const network of this.runtime.state.networks) {
+      const pace = this.paces.get(network.id) ?? { peakBytesPerSec: 0, readings: [] }
+      const { readings } = pace
+      const last = readings.at(-1)
+      const slid = last ? 0.5 ** ((now - last.time) / PEAK_HALF_LIFE_MS) : 0
+      pace.peakBytesPerSec = Math.max(pace.peakBytesPerSec * slid, network.speedBytesPerSec)
+      readings.push({ time: now, received: this.trafficOf(network.id).received })
+      while (readings.length > 2 && readings[1].time <= now - LOAD_WINDOW_MS) readings.shift()
+      this.paces.set(network.id, pace)
+    }
+  }
+
+  /** Each network's rate over about the last second, and its peak, for the scheduler. */
+  private networkLoads(): Map<string, NetworkLoad> {
+    const loads = new Map<string, NetworkLoad>()
+    for (const [id, { peakBytesPerSec, readings }] of this.paces) {
+      const first = readings[0]
+      const last = readings.at(-1)!
+      // Under a full window, it hasn't been watched long enough to tell.
+      if (last.time - first.time < LOAD_WINDOW_MS) continue
+      const speedBytesPerSec = ((last.received - first.received) / (last.time - first.time)) * 1000
+      loads.set(id, { speedBytesPerSec, peakBytesPerSec })
+    }
+    return loads
   }
 
   /** Looks at whether the disk is what holds the download back, and tells the user: as soon as
@@ -431,6 +486,7 @@ export class HttpTransfer implements Transfer {
   reset(): void {
     this.avoidNetworkByBlock.clear()
     this.aheadByBlock.clear()
+    this.paces.clear()
     this.reconciled.clear()
     this.disk.reset()
   }
@@ -1232,6 +1288,7 @@ export class HttpTransfer implements Transfer {
             avoid: this.avoidNetworkByBlock,
             hedgesUsed: this.hedgesByBlock,
             segments: this.aheadByBlock,
+            networks: this.networkLoads(),
             diskBehind: this.disk.reading === 'behind'
           },
           {

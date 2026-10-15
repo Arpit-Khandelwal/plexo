@@ -3,6 +3,7 @@ import fc from 'fast-check'
 import {
   pickWork,
   type AttemptView,
+  type NetworkLoad,
   type SchedulerPolicy,
   type SchedulerState
 } from '../src/main/download/scheduler'
@@ -45,13 +46,15 @@ function state(parts: {
   attempts?: [number, AttemptView[]][]
   avoid?: [number, string][]
   hedgesUsed?: [number, number][]
+  networks?: [string, NetworkLoad][]
 }): SchedulerState {
   return {
     blocks: parts.blocks,
     streams: parts.streams ?? [],
     attempts: new Map(parts.attempts),
     avoid: new Map(parts.avoid),
-    hedgesUsed: new Map(parts.hedgesUsed)
+    hedgesUsed: new Map(parts.hedgesUsed),
+    networks: parts.networks && new Map(parts.networks)
   }
 }
 
@@ -376,7 +379,8 @@ test('no racing while the disk is behind, and racing resumes once it keeps up', 
 
 test.describe('scheduler: splitting a block at the end', () => {
   // Block 0 is 4 MiB, 1 MiB of it done, held by stream 0 on network a at `speed`: as when a
-  // server caps each connection, a free stream is no faster than the holder.
+  // server caps each connection, a free stream is no faster than the holder, and the network
+  // runs at a quarter of its peak now that most of its streams are done.
   const MIB = 1024 * 1024
   const SPLIT_POLICY: SchedulerPolicy = { ...POLICY, minSplitBytes: 256 * 1024 }
   const big = (status: HttpBlockStatus, bytes: number): HttpBlockState => ({
@@ -388,11 +392,18 @@ test.describe('scheduler: splitting a block at the end', () => {
     startOffset,
     received
   })
+  const load = (speedBytesPerSec: number, peakBytesPerSec: number): NetworkLoad => ({
+    speedBytesPerSec,
+    peakBytesPerSec
+  })
+  const SPARE = load(1_000_000, 4_000_000)
+  const FULL = load(3_900_000, 4_000_000)
   const capped = (speed: number, over: Partial<Parameters<typeof state>[0]> = {}): SchedulerState =>
     state({
       blocks: [big('downloading', MIB)],
       streams: [stream(0, 'a', 'downloading', speed), stream(1, 'a', 'pending')],
       attempts: [[0, [held(0, MIB)]]],
+      networks: [['a', SPARE]],
       ...over
     })
   const split = (
@@ -476,5 +487,41 @@ test.describe('scheduler: splitting a block at the end', () => {
       ]
     })
     expect(split(s, 100_000)).toBeUndefined()
+  })
+
+  test('only while the networks have room to spare: on a full one the holder speeds up by itself', () => {
+    expect(
+      split(capped(100_000, { networks: [['a', FULL]] }), 100_000)?.startOffset
+    ).toBeUndefined()
+    // Not known, or no peak measured yet: as if full.
+    expect(split(capped(100_000, { networks: [] }), 100_000)?.startOffset).toBeUndefined()
+    expect(
+      split(capped(100_000, { networks: [['a', load(0, 0)]] }), 100_000)?.startOffset
+    ).toBeUndefined()
+  })
+
+  test("both networks need room: the requester's, and the holder's", () => {
+    // The holder is on network b, the requester on a.
+    const across = (a: NetworkLoad, b: NetworkLoad): SchedulerState =>
+      capped(100_000, {
+        streams: [stream(0, 'b', 'downloading', 100_000), stream(1, 'a', 'pending')],
+        attempts: [[0, [{ ...held(0, MIB), networkId: 'b' }]]],
+        networks: [
+          ['a', a],
+          ['b', b]
+        ]
+      })
+    expect(split(across(SPARE, SPARE), 100_000)?.startOffset).toBe(MIB + 1.5 * MIB)
+    // A full holder network: the holder would run on past the split point.
+    expect(split(across(SPARE, FULL), 100_000)?.startOffset).toBeUndefined()
+    // A full requester network: the split would only take from its other streams.
+    expect(split(across(FULL, SPARE), 100_000)?.startOffset).toBeUndefined()
+  })
+
+  test('a holder that went quiet is still raced on a full network, as before', () => {
+    const s = capped(0, { networks: [['a', FULL]] })
+    const work = split(s, 100_000)
+    expect(work?.kind).toBe('hedge')
+    expect(work?.startOffset).toBeUndefined()
   })
 })

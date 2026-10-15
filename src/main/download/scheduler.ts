@@ -18,7 +18,9 @@ import type { HttpBlockState, HttpStreamState } from '../../shared/types'
 //            than the holder, as when a server caps each connection, so a duplicate would only
 //            fetch the same bytes as slowly. Each fetches its own part and the block is done
 //            when they meet, so the free streams at the end of a download share its last blocks
-//            instead of watching one connection crawl through each.
+//            instead of watching one connection crawl through each. Only while both networks
+//            have room to spare (see hasSpare): on a network that is already full, the holder
+//            speeds up by itself as the others finish, and a split would only take from them.
 
 export interface AttemptView {
   kind: 'primary' | 'hedge'
@@ -33,6 +35,12 @@ export interface AttemptView {
    * has received from there. Without them, its block is never split. */
   startOffset?: number | null
   received?: number
+}
+
+/** A network's speed now and the best it has held lately. */
+export interface NetworkLoad {
+  speedBytesPerSec: number
+  peakBytesPerSec: number
 }
 
 /** Bytes of a block fetched ahead of where its first byte has got to (by a split), as offsets
@@ -55,6 +63,8 @@ export interface SchedulerState {
   diskBehind?: boolean
   /** By block index, what splits have fetched there that isn't joined to the block's start yet. */
   segments?: ReadonlyMap<number, readonly Segment[]>
+  /** By network id, how it is doing (see hasSpare). Without it, blocks are never split. */
+  networks?: ReadonlyMap<string, NetworkLoad>
 }
 
 export interface SchedulerPolicy {
@@ -103,6 +113,22 @@ function nextWaitingBlock(state: SchedulerState, networkId: string): HttpBlockSt
   )
 }
 
+// A network running under this share of the best it has held lately has room for more requests.
+// Clearly under: a full network wobbles a little below its peak, and a split there would only take
+// from its other streams.
+const SPARE_SHARE = 0.85
+
+/** Whether a network has room for another request: it runs well under the best it has held
+ * lately, as when a server caps each connection and the streams that freed up took their share
+ * with them. A network that is full instead speeds up its remaining streams as others finish.
+ * Not known, it hasn't. */
+function hasSpare(state: SchedulerState, networkId: string): boolean {
+  const load = state.networks?.get(networkId)
+  return (
+    !!load && load.peakBytesPerSec > 0 && load.speedBytesPerSec < SPARE_SHARE * load.peakBytesPerSec
+  )
+}
+
 /** Where in `block` a split by `who` would start, and how long the block would take without it,
  * if splitting would clearly finish it sooner. The part split is the end of what the slowest
  * attempt has left: from where it has got to up to where the next attempt or segment begins.
@@ -118,6 +144,8 @@ function splitPoint(
   const minBytes = policy.minSplitBytes
   const mine = who.speedBytesPerSec
   if (!minBytes || !mine || block.rangeEnd === null) return undefined
+  // Only bandwidth that would otherwise go unused makes a split worth it.
+  if (!hasSpare(state, who.networkId)) return undefined
   const length = block.rangeEnd - block.rangeStart + 1
   const starts = [
     ...attempts.map((attempt) => attempt.startOffset ?? null),
@@ -125,16 +153,21 @@ function splitPoint(
   ]
   if (starts.includes(null)) return undefined
 
-  let slowest: { from: number; to: number; speed: number; eta: number } | undefined
+  let slowest:
+    { from: number; to: number; speed: number; eta: number; networkId: string } | undefined
   for (const attempt of attempts) {
     const speed = speedOf(attempt.streamId)
     if (!speed || attempt.received === undefined) return undefined
     const from = Math.max(attempt.startOffset! + attempt.received, block.bytesDownloaded)
     const to = Math.min(length, ...starts.filter((start) => start! > from).map((start) => start!))
     const eta = ((to - from) / speed) * 1000
-    if (to > from && (!slowest || eta > slowest.eta)) slowest = { from, to, speed, eta }
+    if (to > from && (!slowest || eta > slowest.eta))
+      slowest = { from, to, speed, eta, networkId: attempt.networkId }
   }
   if (!slowest || slowest.eta < policy.hedgeAfterMs) return undefined
+  // A holder on a full network gets faster as its neighbours finish, and would run on past the
+  // split into bytes the split is fetching too.
+  if (!hasSpare(state, slowest.networkId)) return undefined
 
   const share = Math.floor(((slowest.to - slowest.from) * mine) / (slowest.speed + mine))
   if (share < minBytes || slowest.to - slowest.from - share < minBytes) return undefined
