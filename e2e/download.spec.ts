@@ -91,6 +91,30 @@ test.describe('happy paths @smoke', () => {
     expect(state.streams).toHaveLength(1)
   })
 
+  test('server that refuses range requests with 403: one stream, whole file', async ({
+    plexo,
+    serve
+  }) => {
+    const origin = await serve({ size: 10 * BLOCK })
+    origin.setRule(({ range }) => (range ? { status: 403 } : 'ok'))
+    const probe = await plexo.api.probeUrl(origin.url())
+    expect(probe).toMatchObject({ kind: 'http', supportsRanges: false, totalBytes: 10 * BLOCK })
+    await plexo.start(origin.url(), origin.sha256)
+    const state = await plexo.waitForHttpStatus('completed')
+    expect(state.streams).toHaveLength(1)
+    // After the probe's ranged GET, nothing else asks for a range the server would refuse.
+    expect(origin.chunkRequests().filter((request) => request.range !== null)).toEqual([])
+  })
+
+  test('a link that answers 403 with or without a range is still an error', async ({
+    plexo,
+    serve
+  }) => {
+    const origin = await serve({ size: 3 * BLOCK })
+    origin.setRule(() => ({ status: 403 }))
+    await expect(plexo.api.probeUrl(origin.url())).rejects.toThrow(/status 403/)
+  })
+
   test('unknown size (no Content-Length)', async ({ plexo, serve }) => {
     const origin = await serve({ size: 10 * BLOCK, ranges: false, contentLength: false })
     await plexo.start(origin.url(), origin.sha256)
