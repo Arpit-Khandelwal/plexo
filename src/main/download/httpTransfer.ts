@@ -848,9 +848,15 @@ export class HttpTransfer implements Transfer {
     this.aheadByBlock.set(block.index, segments)
   }
 
-  /** Stops every attempt still fetching a block that is done. */
+  /** Stops every attempt still fetching a block that is done. Their streams show as free at
+   * once: their requests only end once the abort reaches them, and until then they would show
+   * holding a block that is no longer in flight. */
   private loseRivals(block: HttpBlockState): void {
-    for (const rival of this.attempts.get(block.index) ?? []) this.abortAttempt(rival, 'lost')
+    for (const rival of this.attempts.get(block.index) ?? []) {
+      this.abortAttempt(rival, 'lost')
+      const stream = this.runtime.state.streams.find((chunk) => chunk.id === rival.streamId)
+      if (stream) this.goIdle(stream)
+    }
   }
 
   /** Applies what became of an attempt to the download. 'stop' ends the stream. */
