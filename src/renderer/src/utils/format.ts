@@ -13,7 +13,11 @@ const UNITS = ['B', 'KB', 'MB', 'GB', 'TB']
 
 export function formatBytes(bytes: number): string {
   if (!Number.isFinite(bytes) || bytes <= 0) return '0 B'
-  let exponent = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), UNITS.length - 1)
+  // Under 1 byte (a slow speed averaged over a few seconds) is still bytes, not a unit below them.
+  let exponent = Math.max(
+    0,
+    Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), UNITS.length - 1)
+  )
   let value = bytes / 1024 ** exponent
   if (exponent < UNITS.length - 1 && Number(value.toFixed(exponent === 0 ? 0 : 1)) >= 1024) {
     exponent += 1
@@ -137,7 +141,10 @@ export function wantedBytes(download: DownloadState | FinishedDownload): number 
 
 export function formatPercent(bytesDownloaded: number, totalBytes: number): number {
   if (totalBytes <= 0) return 0
-  return Math.min(100, Math.round((bytesDownloaded / totalBytes) * 100))
+  // 100% only once every byte is in: rounding 99.6% up would claim a 10 GB file was done with
+  // 40 MB still to go.
+  if (bytesDownloaded >= totalBytes) return 100
+  return Math.min(99, Math.round((bytesDownloaded / totalBytes) * 100))
 }
 
 export function fileNameFromPath(path: string): string {
