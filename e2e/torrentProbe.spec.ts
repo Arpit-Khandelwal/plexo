@@ -182,18 +182,19 @@ test.describe('getting a torrent in', () => {
     })
   })
 
-  test('a peer that turns up after the first search came back empty still answers', async ({
-    plexo
-  }) => {
-    // The DHT's only node, which knows of no peer until the seeder joins it later on.
+  test('a second search finds a peer the first one missed', async ({ plexo }) => {
+    // The DHT's only node. It knows of no peer until the test announces the seeder to it, after
+    // the first search came back empty.
     const { default: DHT } = (await import('bittorrent-dht' as string)) as {
       default: new (options: object) => {
         listen(port: number, address: string, cb: () => void): void
         address(): { port: number }
+        announce(infoHash: string, port: number, cb: (error?: Error) => void): void
         destroy(cb?: () => void): void
       }
     }
-    const node = new DHT({ bootstrap: false })
+    // `host`: what it announces is also kept in its own peer list, for a get_peers to find.
+    const node = new DHT({ bootstrap: false, host: '127.0.0.1' })
     await new Promise<void>((resolve) => node.listen(0, '127.0.0.1', resolve))
     const bootstrap = `127.0.0.1:${node.address().port}`
     try {
@@ -202,22 +203,20 @@ test.describe('getting a torrent in', () => {
         PLEXO_E2E_DHT_BOOTSTRAP: bootstrap,
         PLEXO_E2E_MAGNET_GRACE_MS: '15000'
       })
-      const data = named(seededBytes(300_000, 8), 'late.mkv')
-      // The same file seeded first by a client nobody can find, just to learn its info hash.
-      const { client: hashOnly, torrent: first } = await seed([data])
-      const infoHash = first.infoHash
-      await new Promise((done) => hashOnly.destroy(done))
+      // Off the DHT, with no tracker: it never learns of Plexo, so it can't connect to it. Plexo
+      // can only find it by asking the DHT node again.
+      const { client: seeder, torrent } = await seed([named(seededBytes(300_000, 8), 'late.mkv')])
+      clients.push(seeder)
 
       const link = await plexo.newDownload()
-      await link.fill(`magnet:?xt=urn:btih:${infoHash}&dn=late`)
+      await link.fill(`magnet:?xt=urn:btih:${torrent.infoHash}&dn=late`)
       await expect(plexo.page.getByText('No peers found yet, still looking…')).toBeVisible()
 
-      const seeder = new (await loadWebTorrent())({
-        ...quiet,
-        dht: { bootstrap: [bootstrap] }
-      })
-      clients.push(seeder)
-      await new Promise<Torrent>((resolve) => seeder.seed(data, { announce: [] }, resolve))
+      await new Promise<void>((resolve, reject) =>
+        node.announce(torrent.infoHash, seeder.address().port, (error) =>
+          error ? reject(error) : resolve()
+        )
+      )
 
       // Its details arrived: the name, and the file list.
       await expect(plexo.page.getByText('late.mkv').first()).toBeVisible({ timeout: 20_000 })
