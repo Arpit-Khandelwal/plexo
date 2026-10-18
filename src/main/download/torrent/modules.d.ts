@@ -81,8 +81,12 @@ declare module 'webtorrent' {
     constructor(options?: ClientOptions)
     maxConns: number
     destroyed: boolean
-    /** Its DHT (bittorrent-dht); false when turned off. */
-    dht: EventEmitter | false | null
+    /** Its DHT (bittorrent-dht); false when turned off. `lookup` searches it for a torrent's
+     * peers again, handing them to the torrent; it returns a function that stops the search. */
+    dht:
+      | (EventEmitter & { lookup(infoHash: string, callback?: () => void): () => void })
+      | false
+      | null
     torrents: Torrent[]
     add(torrentId: string | Uint8Array, options?: AddOptions): Torrent
     seed(
